@@ -127,12 +127,16 @@ func (s *AFPacketSource) loop() {
 		for _, lt := range decoded {
 			switch lt {
 			case layers.LayerTypeIPv4:
-				pkt.SrcIP = ip4.SrcIP
-				pkt.DstIP = ip4.DstIP
+				// ip4.SrcIP/DstIP are sub-slices of the zero-copy capture
+				// buffer, which the *next* ZeroCopyReadPacketData overwrites.
+				// This Packet is consumed asynchronously via s.out, so the IPs
+				// must be copied out of the shared buffer or they corrupt.
+				pkt.SrcIP = append(net.IP(nil), ip4.SrcIP...)
+				pkt.DstIP = append(net.IP(nil), ip4.DstIP...)
 				haveL3 = true
 			case layers.LayerTypeIPv6:
-				pkt.SrcIP = ip6.SrcIP
-				pkt.DstIP = ip6.DstIP
+				pkt.SrcIP = append(net.IP(nil), ip6.SrcIP...)
+				pkt.DstIP = append(net.IP(nil), ip6.DstIP...)
 				haveL3 = true
 			case layers.LayerTypeTCP:
 				pkt.Proto = ProtoTCP
