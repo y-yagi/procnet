@@ -8,6 +8,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -33,6 +35,7 @@ func run() error {
 		out    = flag.String("out", "", "write final per-process totals to this file on exit (.json or .csv)")
 		noTUI  = flag.Bool("no-tui", false, "headless mode: periodically print totals to stdout instead of the TUI")
 		logInt = flag.Duration("log-interval", 5*time.Second, "how often to print a summary line in -no-tui mode")
+		dbgUnk = flag.String("debug-unknown", "", "log every unattributed (\"unknown\") packet to this file: reason, proto, direction, src->dst, bytes")
 	)
 	flag.Parse()
 
@@ -51,9 +54,19 @@ func run() error {
 	}
 	defer src.Close()
 
+	var dbg *unknownLogger
+	if *dbgUnk != "" {
+		f, err := os.Create(*dbgUnk)
+		if err != nil {
+			return fmt.Errorf("opening -debug-unknown file %s: %w", *dbgUnk, err)
+		}
+		defer f.Close()
+		dbg = &unknownLogger{l: log.New(f, "", log.LstdFlags|log.Lmicroseconds)}
+	}
+
 	agg := aggregate.New()
 	resolver := procmap.NewResolver()
-	go pump(src, resolver, agg)
+	go pump(src, resolver, agg, dbg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -79,9 +92,15 @@ func run() error {
 // pump reads decoded packets from src, resolves each to an owning process
 // via resolver, and feeds the byte counts into agg. It returns when src's
 // channel closes (i.e. after Close()).
-func pump(src capture.PacketSource, resolver *procmap.Resolver, agg *aggregate.Aggregator) {
+func pump(src capture.PacketSource, resolver *procmap.Resolver, agg *aggregate.Aggregator, dbg *unknownLogger) {
 	for pkt := range src.Packets() {
-		if pkt.Direction == capture.DirUnknown || pkt.Proto == capture.ProtoUnknown {
+		if pkt.Proto == capture.ProtoUnknown {
+			dbg.log("proto-unknown", pkt)
+			agg.AddRecv(aggregate.UnknownPID, aggregate.UnknownName, uint64(pkt.Length))
+			continue
+		}
+		if pkt.Direction == capture.DirUnknown {
+			dbg.log("direction-unknown", pkt)
 			agg.AddRecv(aggregate.UnknownPID, aggregate.UnknownName, uint64(pkt.Length))
 			continue
 		}
@@ -100,6 +119,7 @@ func pump(src capture.PacketSource, resolver *procmap.Resolver, agg *aggregate.A
 
 		pid, name, ok := resolver.Lookup(proto, localIP, localPort, remoteIP, remotePort)
 		if !ok {
+			dbg.log("lookup-miss", pkt)
 			pid, name = aggregate.UnknownPID, aggregate.UnknownName
 		}
 
@@ -110,4 +130,51 @@ func pump(src capture.PacketSource, resolver *procmap.Resolver, agg *aggregate.A
 			agg.AddRecv(pid, name, uint64(pkt.Length))
 		}
 	}
+}
+
+// unknownLogger writes one line per unattributed packet to a file, so the
+// contents of the "unknown" bucket can be inspected without disturbing the
+// TUI (which owns stdout/stderr).
+type unknownLogger struct {
+	l *log.Logger
+}
+
+// log records a single unknown packet. A nil receiver is a no-op, so callers
+// can pass a nil *unknownLogger when -debug-unknown is not set.
+func (u *unknownLogger) log(reason string, pkt capture.Packet) {
+	if u == nil {
+		return
+	}
+	u.l.Printf("reason=%s proto=%s dir=%s %s -> %s len=%d",
+		reason, protoName(pkt.Proto), dirName(pkt.Direction),
+		hostPort(pkt.SrcIP, pkt.SrcPort), hostPort(pkt.DstIP, pkt.DstPort), pkt.Length)
+}
+
+func protoName(p capture.Proto) string {
+	switch p {
+	case capture.ProtoTCP:
+		return "tcp"
+	case capture.ProtoUDP:
+		return "udp"
+	default:
+		return "unknown"
+	}
+}
+
+func dirName(d capture.Direction) string {
+	switch d {
+	case capture.DirOutbound:
+		return "out"
+	case capture.DirInbound:
+		return "in"
+	default:
+		return "unknown"
+	}
+}
+
+func hostPort(ip net.IP, port uint16) string {
+	if ip == nil {
+		return fmt.Sprintf("?:%d", port)
+	}
+	return net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port))
 }
