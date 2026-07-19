@@ -66,6 +66,107 @@ func addFakeFD(t *testing.T, root string, pid int, fd int, target string) {
 	}
 }
 
+// fakeFlowResolver is a minimal, hermetic FlowResolver test double (standing
+// in for internal/ebpf's Source, which this package deliberately does not
+// import -- see resolver.go's FlowResolver doc comment). It answers purely
+// from fields set by the test and counts invocations, so tests can assert
+// on the tuples-cache short-circuit without any real eBPF or /proc
+// involvement.
+type fakeFlowResolver struct {
+	calls int
+	pid   int
+	comm  string
+	ok    bool
+}
+
+func (f *fakeFlowResolver) LookupFlow(proto Proto, localIP net.IP, localPort uint16, remoteIP net.IP, remotePort uint16) (int, string, bool) {
+	f.calls++
+	return f.pid, f.comm, f.ok
+}
+
+// TestResolverFlowResolverHitSkipsProc checks that a FlowResolver hit is
+// trusted directly: the flow resolves correctly even though the fixture
+// /proc tree has nothing that could ever resolve it on its own, and the
+// FlowResolver's comm is used verbatim as the returned name.
+func TestResolverFlowResolverHitSkipsProc(t *testing.T) {
+	root := t.TempDir()
+	writeTCPFile(t, root) // deliberately empty: /proc alone can't resolve this
+
+	r := NewResolver()
+	r.procRoot = root
+
+	fr := &fakeFlowResolver{pid: 777, comm: "curl", ok: true}
+	r.SetFlowResolver(fr)
+
+	local := net.ParseIP("10.0.0.5")
+	remote := net.ParseIP("93.184.216.34")
+	pid, name, ok := r.Lookup(ProtoTCP, local, 54321, remote, 443)
+	if !ok || pid != 777 || name != "curl" {
+		t.Fatalf("Lookup = (%d, %q, %v), want (777, \"curl\", true)", pid, name, ok)
+	}
+	if fr.calls != 1 {
+		t.Fatalf("FlowResolver.LookupFlow calls = %d, want 1", fr.calls)
+	}
+}
+
+// TestResolverFlowResolverMissFallsBackToProc checks that a FlowResolver
+// miss (ok=false, e.g. an IPv6 flow it doesn't track) doesn't stop
+// resolution: Lookup must still fall back to the existing /proc-based
+// logic, unchanged.
+func TestResolverFlowResolverMissFallsBackToProc(t *testing.T) {
+	root := t.TempDir()
+	writeTCPFile(t, root, tcpLine(t, 0, "127.0.0.1", 8080, "127.0.0.1", 80, 16314))
+	addFakeFD(t, root, 100, 3, "socket:[16314]")
+
+	r := NewResolver()
+	r.procRoot = root
+
+	fr := &fakeFlowResolver{ok: false}
+	r.SetFlowResolver(fr)
+
+	pid, _, ok := r.Lookup(ProtoTCP, net.ParseIP("127.0.0.1"), 8080, net.ParseIP("127.0.0.1"), 80)
+	if !ok || pid != 100 {
+		t.Fatalf("Lookup = (%d, _, %v), want (100, _, true) via /proc fallback", pid, ok)
+	}
+	if fr.calls != 1 {
+		t.Fatalf("FlowResolver.LookupFlow calls = %d, want 1", fr.calls)
+	}
+}
+
+// TestResolverTuplesCacheCheckedBeforeFlowResolver checks that once a flow
+// has been resolved (here, via the FlowResolver), its later packets are
+// answered entirely from the in-process tuples cache -- Lookup must not
+// call LookupFlow again for the same tuple.
+func TestResolverTuplesCacheCheckedBeforeFlowResolver(t *testing.T) {
+	root := t.TempDir()
+	writeTCPFile(t, root) // empty: only the FlowResolver can answer this flow
+
+	r := NewResolver()
+	r.procRoot = root
+
+	fr := &fakeFlowResolver{pid: 42, comm: "sshd", ok: true}
+	r.SetFlowResolver(fr)
+
+	local := net.ParseIP("10.0.0.9")
+	remote := net.ParseIP("10.0.0.10")
+
+	pid, name, ok := r.Lookup(ProtoTCP, local, 2222, remote, 22)
+	if !ok || pid != 42 {
+		t.Fatalf("first Lookup = (%d, %q, %v), want (42, _, true)", pid, name, ok)
+	}
+	if fr.calls != 1 {
+		t.Fatalf("after first Lookup, FlowResolver calls = %d, want 1", fr.calls)
+	}
+
+	pid, name, ok = r.Lookup(ProtoTCP, local, 2222, remote, 22)
+	if !ok || pid != 42 {
+		t.Fatalf("second Lookup = (%d, %q, %v), want (42, _, true)", pid, name, ok)
+	}
+	if fr.calls != 1 {
+		t.Fatalf("after second Lookup, FlowResolver calls = %d, want still 1 (tuples cache should have short-circuited)", fr.calls)
+	}
+}
+
 // TestResolverOnDemandResolution exercises the full miss path added to
 // Lookup: a flow that only appears in /proc *after* the last periodic
 // refresh must still be resolved, via an on-demand re-read of the (cheap)

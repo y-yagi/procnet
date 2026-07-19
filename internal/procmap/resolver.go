@@ -56,6 +56,22 @@ type cachedPID struct {
 	expires time.Time
 }
 
+// FlowResolver is an optional, faster source of 5-tuple->process attribution
+// that Resolver consults before falling back to its own /proc-based logic.
+// In practice this is implemented by internal/ebpf's Source, which
+// populates its answers from a BPF map filled in-kernel at send time -- but
+// procmap does not import that package (or know anything eBPF-specific):
+// this interface is the sole, one-way boundary between the two, so procmap
+// stays fully usable (and testable) with no eBPF toolchain at all.
+type FlowResolver interface {
+	// LookupFlow resolves the process that owns the local socket
+	// (localIP, localPort) connected to (remoteIP, remotePort) over proto.
+	// ok is false if the flow is unknown to this resolver (for example: an
+	// IPv6 flow, when the underlying source only tracks IPv4) -- that is
+	// not an error, it just means the caller should fall back.
+	LookupFlow(proto Proto, localIP net.IP, localPort uint16, remoteIP net.IP, remotePort uint16) (pid int, comm string, ok bool)
+}
+
 // Resolver maps live network flows to the local process that owns them, by
 // periodically parsing /proc/net/{tcp,tcp6,udp,udp6} and /proc/*/fd/*. It is
 // safe for concurrent use.
@@ -65,6 +81,10 @@ type Resolver struct {
 	// procRoot is normally "/proc"; it exists as a field so tests can point
 	// it at a fixture directory tree.
 	procRoot string
+
+	// flow, if set via SetFlowResolver, is consulted right after the
+	// in-process tuples cache and before any /proc work -- see Lookup.
+	flow FlowResolver
 
 	lastRefresh     time.Time
 	lastMissRefresh time.Time
@@ -86,9 +106,23 @@ func NewResolver() *Resolver {
 	}
 }
 
+// SetFlowResolver installs an optional faster attribution source (e.g. an
+// eBPF-backed one) that Lookup consults before its own /proc-based logic.
+// Passing nil (the zero value) restores /proc-only behavior. Not safe to
+// call concurrently with Lookup.
+func (r *Resolver) SetFlowResolver(f FlowResolver) {
+	r.flow = f
+}
+
 // Lookup resolves the process owning the local socket (localIP, localPort)
 // connected to (remoteIP, remotePort) over proto. ok is false if no owning
 // process could be determined.
+//
+// Resolution order: (1) the in-process tuples cache, so a flow only ever
+// pays for BPF/proc work once; (2) the optional FlowResolver (e.g. eBPF),
+// which -- unlike /proc -- can know about a flow from its very first
+// packet; (3) the existing /proc-based exact/byLocal/inode logic, including
+// its on-demand miss path, completely unchanged.
 func (r *Resolver) Lookup(proto Proto, localIP net.IP, localPort uint16, remoteIP net.IP, remotePort uint16) (pid int, name string, ok bool) {
 	key := tupleKey{
 		proto:      proto,
@@ -101,18 +135,24 @@ func (r *Resolver) Lookup(proto Proto, localIP net.IP, localPort uint16, remoteI
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.refreshLocked()
-
 	now := time.Now()
+
+	if c, found := r.tuples[key]; found && now.Before(c.expires) {
+		return c.pid, c.name, true
+	}
+
+	if r.flow != nil {
+		if fpid, comm, found := r.flow.LookupFlow(proto, localIP, localPort, remoteIP, remotePort); found {
+			return r.rememberNamed(key, fpid, comm, now)
+		}
+	}
+
+	r.refreshLocked()
 
 	if inode, found := r.lookupInodeLocked(key, proto, localIP, localPort); found {
 		if pid, found2 := r.inodeToPID[inode]; found2 {
 			return r.remember(key, pid, now)
 		}
-	}
-
-	if c, found := r.tuples[key]; found && now.Before(c.expires) {
-		return c.pid, c.name, true
 	}
 
 	// Every existing cache missed. Check the short-TTL negative cache next:
@@ -179,8 +219,20 @@ func (r *Resolver) lookupInodeLocked(key tupleKey, proto Proto, localIP net.IP, 
 	return 0, false
 }
 
+// remember caches key->pid (resolved via /proc, so its name is looked up
+// the usual way) and returns it as a resolved Lookup result.
 func (r *Resolver) remember(key tupleKey, pid int, now time.Time) (int, string, bool) {
-	name := processName(pid)
+	return r.rememberNamed(key, pid, "", now)
+}
+
+// rememberNamed caches key->pid and returns it as a resolved Lookup result.
+// If name is non-empty (e.g. the "comm" a FlowResolver already read out of
+// the kernel), it's used as-is; otherwise the process's name is looked up
+// the existing way, via /proc/<pid>/comm.
+func (r *Resolver) rememberNamed(key tupleKey, pid int, name string, now time.Time) (int, string, bool) {
+	if name == "" {
+		name = processName(pid)
+	}
 	r.tuples[key] = cachedPID{pid: pid, name: name, expires: now.Add(tupleTTL)}
 	delete(r.negative, key)
 	return pid, name, true

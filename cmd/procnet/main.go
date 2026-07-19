@@ -17,6 +17,7 @@ import (
 
 	"github.com/y-yagi/procnet/internal/aggregate"
 	"github.com/y-yagi/procnet/internal/capture"
+	"github.com/y-yagi/procnet/internal/ebpf"
 	"github.com/y-yagi/procnet/internal/export"
 	"github.com/y-yagi/procnet/internal/procmap"
 	"github.com/y-yagi/procnet/internal/ui"
@@ -31,13 +32,20 @@ func main() {
 
 func run() error {
 	var (
-		iface  = flag.String("i", "", "network interface to monitor (default: current default-route interface)")
-		out    = flag.String("out", "", "write final per-process totals to this file on exit (.json or .csv)")
-		noTUI  = flag.Bool("no-tui", false, "headless mode: periodically print totals to stdout instead of the TUI")
-		logInt = flag.Duration("log-interval", 5*time.Second, "how often to print a summary line in -no-tui mode")
-		dbgUnk = flag.String("debug-unknown", "", "log every unattributed (\"unknown\") packet to this file: reason, proto, direction, src->dst, bytes")
+		iface    = flag.String("i", "", "network interface to monitor (default: current default-route interface)")
+		out      = flag.String("out", "", "write final per-process totals to this file on exit (.json or .csv)")
+		noTUI    = flag.Bool("no-tui", false, "headless mode: periodically print totals to stdout instead of the TUI")
+		logInt   = flag.Duration("log-interval", 5*time.Second, "how often to print a summary line in -no-tui mode")
+		dbgUnk   = flag.String("debug-unknown", "", "log every unattributed (\"unknown\") packet to this file: reason, proto, direction, src->dst, bytes")
+		ebpfMode = flag.String("ebpf", "auto", "eBPF-based attribution: auto (use if available, default), on (fail if unavailable), off (/proc only)")
 	)
 	flag.Parse()
+
+	switch *ebpfMode {
+	case "auto", "on", "off":
+	default:
+		return fmt.Errorf("invalid -ebpf value %q: must be auto, on, or off", *ebpfMode)
+	}
 
 	ifaceName := *iface
 	if ifaceName == "" {
@@ -66,6 +74,20 @@ func run() error {
 
 	agg := aggregate.New()
 	resolver := procmap.NewResolver()
+
+	if *ebpfMode != "off" {
+		es, err := ebpf.NewSource()
+		if err != nil {
+			if *ebpfMode == "on" {
+				return fmt.Errorf("eBPF requested (-ebpf=on) but unavailable: %w", err)
+			}
+			fmt.Fprintln(os.Stderr, "procnet: eBPF unavailable, falling back to /proc attribution:", err)
+		} else {
+			resolver.SetFlowResolver(es)
+			defer es.Close()
+		}
+	}
+
 	go pump(src, resolver, agg, dbg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
