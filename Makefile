@@ -15,6 +15,12 @@ EBPF_DIR := internal/ebpf
 BPF_DIR  := $(EBPF_DIR)/bpf
 KERNEL   := $(shell uname -r)
 
+# bpftool used to dump the kernel BTF. The distro's /usr/sbin/bpftool is a
+# wrapper that needs the kernel-matched linux-tools package; if that's
+# missing, point this at any working bpftool (any recent version can dump
+# the running kernel's BTF), e.g. make vmlinux BPFTOOL=$HOME/.local/bin/bpftool
+BPFTOOL ?= bpftool
+
 # libbpf CO-RE headers attribute.bpf.c includes, vendored into $(BPF_DIR).
 LIBBPF_HEADERS := bpf_helpers.h bpf_helper_defs.h bpf_core_read.h bpf_tracing.h bpf_endian.h
 VENDORED       := $(addprefix $(BPF_DIR)/,$(LIBBPF_HEADERS))
@@ -40,13 +46,14 @@ generate: bpf-headers $(BPF_DIR)/vmlinux.h
 vmlinux: $(BPF_DIR)/vmlinux.h
 
 $(BPF_DIR)/vmlinux.h:
-	@command -v bpftool >/dev/null 2>&1 || { \
-		echo "ERROR: bpftool not found. Install: sudo apt install linux-tools-$(KERNEL)"; exit 1; }
-	@bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@ 2>/dev/null; \
+	@command -v $(BPFTOOL) >/dev/null 2>&1 || { \
+		echo "ERROR: bpftool ($(BPFTOOL)) not found. Install: sudo apt install linux-tools-$(KERNEL)"; exit 1; }
+	@$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@ 2>/dev/null; \
 	if [ ! -s $@ ]; then \
 		rm -f $@; \
-		echo "ERROR: bpftool produced no output -- the kernel-specific bpftool is missing."; \
-		echo "       Install it with: sudo apt install linux-tools-$(KERNEL)  (or linux-tools-generic)"; \
+		echo "ERROR: $(BPFTOOL) produced no output -- the kernel-specific bpftool is missing."; \
+		echo "       Install it (sudo apt install linux-tools-$(KERNEL) / linux-tools-generic),"; \
+		echo "       or point make at a working one: make $@ BPFTOOL=/path/to/bpftool"; \
 		exit 1; \
 	fi
 	@echo "generated $@ ($$(wc -l < $@) lines)"
